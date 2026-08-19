@@ -39,8 +39,8 @@ This document covers:
 
 - [ ] Host has been imaged via Foundation with AOS 7.3.1.5 / AHV 10.3.1.4 and is **not yet added** to the cluster.
 - [ ] Root SSH access to the new AHV host's Foundation-assigned/temporary IP.
-- [ ] Upstream physical switch ports for this host are **already** configured for jumbo frames (MTU ≥ 9000) and the correct VLANs/trunking. This SOP does not configure the switch side — confirm with the network team before proceeding. If the switch side isn't ready, stop here; setting host MTU without switch support will pass local checks but fail the jumbo-frame connectivity test in Section 6.6.
-- [ ] Production cluster's actual bridge names, bond names, bond mode, and Virtual Switch names are confirmed (fill in the table in Section 4 — do not rely on the samples).
+- [ ] Upstream physical switch ports for this host are **already** configured for jumbo frames (MTU ≥ 9000), the correct VLANs/trunking, **and a matching LACP port-channel/LAG** for each pair of NICs (`eth0`/`eth1` and `eth2`/`eth3`). This SOP does not configure the switch side — confirm with the network team before proceeding. If the switch side isn't ready, stop here; setting host MTU and LACP without matching switch support will pass local checks but fail the jumbo-frame connectivity test (Section 6.6) and/or LACP negotiation (Section 6.6).
+- [ ] Production cluster's actual bridge names, bond names, bond mode, LACP mode (active/passive), and Virtual Switch names are confirmed and pulled directly from the production cluster config (fill in the table in Section 4 — do not rely on the samples, and do not assume LACP settings). This cluster uses LACP on all uplinks, so bond mode is Active-Active with LACP, not Active-Backup — but the exact LACP mode and fallback/timer settings still need to be read off production before configuring the new host, since these are cluster-specific and not a fixed default.
 - [ ] Standard change window/approval obtained.
 - [ ] IPMI/console access available as a fallback in case a network command locks out SSH.
 
@@ -55,17 +55,25 @@ The values below are **samples only**. Bridge, bond, and Virtual Switch names ar
 | Bridge 1 name | `br0` | _______ |
 | Bridge 1 NICs | `eth0`, `eth1` | _______ |
 | Bridge 1 uplink bond name | `br0-up` | _______ |
-| Bridge 1 bond mode | `active-backup` | _______ (active-backup / balance-slb / balance-tcp+LACP) |
+| Bridge 1 bond mode | `balance-tcp` (Active-Active with LACP) | _______ — confirm this is still `balance-tcp`, not `balance-slb`, on production |
+| Bridge 1 LACP mode | `active` | _______ (active / passive — must match what production actually negotiates with) |
+| Bridge 1 LACP fallback (`lacp-fallback-ab`) | `true` | _______ |
+| Bridge 1 LACP time (`lacp-time`) | `slow` (OVS default) | _______ (slow / fast) |
 | Bridge 1 MTU | `9000` | _______ |
 | Bridge 1 typical role | Management / User VM / CVM external traffic | _______ |
 | Bridge 2 name | `br1` | _______ |
 | Bridge 2 NICs | `eth2`, `eth3` | _______ |
 | Bridge 2 uplink bond name | `br1-up` | _______ |
-| Bridge 2 bond mode | `active-backup` | _______ |
+| Bridge 2 bond mode | `balance-tcp` (Active-Active with LACP) | _______ |
+| Bridge 2 LACP mode | `active` | _______ |
+| Bridge 2 LACP fallback (`lacp-fallback-ab`) | `true` | _______ |
+| Bridge 2 LACP time (`lacp-time`) | `slow` (OVS default) | _______ |
 | Bridge 2 MTU | `9000` | _______ |
 | Bridge 2 typical role | Storage / CVM backplane traffic | _______ |
 | Virtual Switch name(s) | `VS0`, `VS1` | _______ |
 | VLAN(s) | — | _______ |
+
+> Do not assume `active` + `slow` + fallback `true` for your production cluster — these are the OVS defaults/common settings, not guaranteed production values. Pull the actual settings from an existing production host (`ovs-vsctl list port br0-up` shows `lacp`, `other_config`, and `bond_mode` together) before configuring the new host.
 
 ---
 
@@ -122,20 +130,26 @@ for i in eth0 eth1 eth2 eth3; do echo "== $i =="; ovs-vsctl get interface $i mtu
 ovs-vsctl del-port br0 br0-up
 ```
 
-**b) Recreate `br0`'s uplink bond with only eth0/eth1:**
+**b) Recreate `br0`'s uplink bond with only eth0/eth1, as Active-Active with LACP:**
 ```bash
-ovs-vsctl add-bond br0 br0-up eth0 eth1 -- set port br0-up bond_mode=active-backup
+ovs-vsctl add-bond br0 br0-up eth0 eth1 \
+  -- set port br0-up bond_mode=balance-tcp \
+  -- set port br0-up lacp=active \
+  -- set port br0-up other_config:lacp-fallback-ab=true
 ```
-Replace `active-backup` with your production bond mode (Section 4) if different — e.g. `balance-slb`, or for LACP: add `lacp=active` to the `set port` clause.
+This cluster's uplinks use LACP on every bridge, so the bond mode is `balance-tcp` with `lacp=active` — this is what Prism's UI labels "Active-Active with LACP." `lacp-fallback-ab=true` is a Nutanix-recommended safeguard: if LACP negotiation ever fails (e.g. a switch-side port-channel misconfiguration), the bond drops back to active-backup instead of dropping all traffic on that bridge. Confirm `lacp` mode (`active` vs `passive`) and the fallback/timer settings against production (Section 4) before running this — don't assume the values above.
 
 **c) Create the `br1` bridge:**
 ```bash
 ovs-vsctl add-br br1
 ```
 
-**d) Create `br1`'s uplink bond with eth2/eth3:**
+**d) Create `br1`'s uplink bond with eth2/eth3, as Active-Active with LACP:**
 ```bash
-ovs-vsctl add-bond br1 br1-up eth2 eth3 -- set port br1-up bond_mode=active-backup
+ovs-vsctl add-bond br1 br1-up eth2 eth3 \
+  -- set port br1-up bond_mode=balance-tcp \
+  -- set port br1-up lacp=active \
+  -- set port br1-up other_config:lacp-fallback-ab=true
 ```
 
 **Validate the split:**
@@ -236,24 +250,49 @@ If `br1` carries no routable/management IP before the host joins the cluster (co
 ```bash
 ovs-appctl bond/show br0-up
 ovs-appctl bond/show br1-up
+ovs-appctl lacp/show br0-up
+ovs-appctl lacp/show br1-up
 ```
-> **Expected output (representative):**
+> **Expected output (representative — `bond/show`, Active-Active with LACP):**
 > ```
 > ---- br0-up ----
-> bond_mode: active-backup
+> bond_mode: balance-tcp
 > bond may include 2 slaves
 > updelay: 0 ms
 > downdelay: 0 ms
-> lacp_status: off
+> lacp_status: negotiated
+> lacp_fallback_ab: true
 >
 > slave eth0: enabled
 >     active slave
 >     may_enable: true
 >
 > slave eth1: enabled
+>     active slave
 >     may_enable: true
 > ```
-> Both slaves should show `may_enable: true`. `may_enable: false` on a slave indicates a link/negotiation problem at the physical layer — resolve before joining the cluster.
+> With LACP active-active, **both** slaves show as `active slave` and carry traffic — this is the key visual difference from active-backup, where only one slave is active at a time. `lacp_status: negotiated` confirms the switch answered the LACP negotiation; both slaves should show `may_enable: true`.
+>
+> **Expected output (representative — `lacp/show`):**
+> ```
+> ---- br0-up ----
+>     status: active negotiated
+>     sys_id: 3c:ec:ef:aa:bb:cc
+>     sys_priority: 65534
+>     aggregation key: 1
+>     lacp_time: slow
+>
+>     slave: eth0: current attached
+>         port_id: 1
+>         port_priority: 65535
+>         may_enable: true
+>
+>     slave: eth1: current attached
+>         port_id: 2
+>         port_priority: 65535
+>         may_enable: true
+> ```
+> `status: active negotiated` and `current attached` on both slaves confirm LACP actually negotiated with the upstream switch — not just that the host requested it. If this instead shows `status: defaulted` (or a slave shows `detached`), LACP did not negotiate: either the switch-side port-channel isn't configured/enabled for these ports, or `lacp` mode (active/passive) doesn't match what the switch expects. With `lacp-fallback-ab=true` the bond will still pass traffic in that case (dropped to active-backup), but this must be resolved with the network team before joining the cluster — a bond running in silent fallback is not the production-matching config this SOP is meant to produce.
 
 ### 6.7 Confirm Persistence
 
@@ -352,17 +391,19 @@ Before pushing an update via `acli net.update_virtual_switch`, run `acli help ne
 | Symptom | Likely cause | Action |
 |---|---|---|
 | `ping -M do -s 8972` fails but local MTU shows 9000 | Upstream switchport not passing jumbo frames | Stop; engage network team. Do not proceed to Section 7. |
-| `ovs-appctl bond/show` shows `may_enable: false` on a slave | Cabling, port-channel/LACP mismatch, or link negotiation issue | Verify physical cabling and switch-side bond/LACP config before proceeding. |
-| Expand Cluster fails at network validation | Bridge/bond naming or MTU still doesn't match production | Re-verify Section 4 values were used exactly (case-sensitive) and re-run Section 6.5. |
+| `ovs-appctl bond/show` shows `may_enable: false` on a slave | Cabling or physical link negotiation issue | Verify physical cabling and NIC/switchport link state before proceeding. |
+| `ovs-appctl lacp/show` shows `status: defaulted` or a slave `detached` | Switch-side port-channel not configured/enabled for these ports, or `lacp` mode (active/passive) mismatch with the switch | Engage the network team; do not proceed to Section 7 even though `lacp-fallback-ab=true` keeps traffic flowing — a bond silently running in active-backup fallback is not the production-matching config this SOP is meant to produce. |
+| Expand Cluster fails at network validation | Bridge/bond naming, bond mode, LACP settings, or MTU still doesn't match production | Re-verify Section 4 values were used exactly (case-sensitive) and re-run Sections 6.5–6.6. |
 | Need to fully revert the new host to Foundation defaults | Aborting the procedure | Run the revert commands below. |
 
-**Revert to a single `br0` bridge with all four NICs (Foundation default):**
+**Revert to a single `br0` bridge with all four NICs, Foundation default (active-backup, no LACP):**
 ```bash
 ovs-vsctl del-port br1 br1-up
 ovs-vsctl del-br br1
 ovs-vsctl del-port br0 br0-up
 ovs-vsctl add-bond br0 br0-up eth0 eth1 eth2 eth3 -- set port br0-up bond_mode=active-backup
 ```
+This intentionally reverts to the simplest factory state (not the production LACP config) — it's an emergency abort path, not a target end state.
 
 ---
 
@@ -378,6 +419,7 @@ ovs-vsctl add-bond br0 br0-up eth0 eth1 eth2 eth3 -- set port br0-up bond_mode=a
 | `ovs-vsctl set interface <if> mtu_request=<n>` | Request an MTU on an interface |
 | `ovs-vsctl get interface <if> mtu` | Read the kernel-negotiated MTU |
 | `ovs-appctl bond/show <bond>` | Bond member status (active/backup, may_enable) |
+| `ovs-appctl lacp/show <bond>` | LACP negotiation status per bond (confirms switch actually negotiated, not just that the host requested it) |
 | `ip link show <if>` | OS-level confirmation of MTU/link state |
 | `ping -M do -s 8972 <ip>` | End-to-end jumbo-frame validation (9000 MTU) |
 | `cluster status` | Cluster-wide service health (from CVM) |
@@ -394,3 +436,4 @@ ovs-vsctl add-bond br0 br0-up eth0 eth1 eth2 eth3 -- set port br0-up bond_mode=a
 | Version | Date | Author | Change |
 |---|---|---|---|
 | 1.0 | 2026-08-19 | Enterprise Architecture | Initial SOP |
+| 1.1 | 2026-08-19 | Enterprise Architecture | Corrected bond mode from Active-Backup to Active-Active with LACP (`balance-tcp`, `lacp=active`, `lacp-fallback-ab=true`) on both `br0`/`br1` to match production, which runs LACP on all uplinks. Added LACP mode/fallback/timers as required prerequisites to pull from production rather than assume. Added `ovs-appctl lacp/show` validation. |
